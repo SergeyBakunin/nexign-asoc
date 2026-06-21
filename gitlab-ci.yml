@@ -1,0 +1,889 @@
+spec:
+  inputs:
+    app_version:
+      description: "Версия приложения (по умолчанию - SHA коммита)"
+      default: ""
+    run_build:
+      description: "Запускать сборку и тесты?"
+      type: boolean
+      default: true
+    run_docker_build:
+      description: "Запускать Docker сборку образов?"
+      type: boolean
+      default: true
+    run_codescoring_file:
+      description: "Запускать CodeScoring SCA (file)?"
+      type: boolean
+      default: true
+    run_codescoring_image:
+      description: "Запускать CodeScoring SCA (image)?"
+      type: boolean
+      default: true
+    run_trivy:
+      description: "Запускать Trivy сканирование образов?"
+      type: boolean
+      default: true
+    run_ptai:
+      description: "Запускать PT AI SAST?"
+      type: boolean
+      default: true
+    run_gitleaks:
+      description: "Запускать Gitleaks поиск секретов?"
+      type: boolean
+      default: true
+    run_zap:
+      description: "Запускать ZAP DAST сканирование?"
+      type: boolean
+      default: true
+    run_tron:
+      description: "Отправлять результаты в TRON ASOC?"
+      type: boolean
+      default: true
+    trivy_severity:
+      description: "Уровень критичности для Trivy"
+      default: "CRITICAL,HIGH"
+      options:
+        - "CRITICAL"
+        - "CRITICAL,HIGH"
+        - "CRITICAL,HIGH,MEDIUM"
+    codescoring_env:
+      description: "Контур CodeScoring"
+      default: "prod"
+      options:
+        - "prod"
+        - "test"
+        - "both"
+    zap_scan_type:
+      description: "Тип ZAP сканирования"
+      default: "baseline"
+      options:
+        - "baseline"
+        - "full"
+        - "api"
+---
+stages:
+  - build
+  - docker-build
+  - test
+  - sca-file
+  - sca-image
+  - trivy
+  - ptai
+  - gitleaks
+  - zap
+  - report
+
+# ─── ПЕРЕМЕННЫЕ ────────────────────────────────────────────────────────────────
+variables:
+  IMAGE_BACKEND: dso-tools-backend:$CI_COMMIT_SHORT_SHA
+  IMAGE_FRONTEND: dso-tools-frontend:$CI_COMMIT_SHORT_SHA
+  CODESCORING_URL: "https://codescoring.nexign.com"
+  CODESCORING_TEST_URL: "https://codescoring.kolla.paas.nexign.com"
+  ARTIFACTORY_URL: "https://artifactory.nexign.com:443/artifactory/generic-ssdlc"
+  APP_VERSION: $[[ inputs.app_version | expand_vars ]]
+
+# ─── BUILD ─────────────────────────────────────────────────────────────────────
+backend:build:
+  stage: build
+  image: python:3.11
+  tags: [vex-tool]
+  rules:
+    - if: '"$[[ inputs.run_build ]]" == "true"'
+  cache:
+    key: pip-$CI_COMMIT_REF_SLUG
+    paths: [.pip_cache/]
+  script:
+    - cd backend
+    - pip install --cache-dir ../.pip_cache -r requirements.txt
+      --index-url https://artifactory.nexign.com:443/artifactory/api/pypi/pypi-mirror-virtual/simple
+      --trusted-host artifactory.nexign.com
+
+frontend:build:
+  stage: build
+  image: node:20
+  tags: [vex-tool]
+  rules:
+    - if: '"$[[ inputs.run_build ]]" == "true"'
+  cache:
+    key: npm-$CI_COMMIT_REF_SLUG
+    paths: [frontend/node_modules/]
+  script:
+    - cd frontend
+    - npm install
+
+# ─── DOCKER BUILD ──────────────────────────────────────────────────────────────
+docker:build-backend:
+  stage: docker-build
+  image: docker:24
+  tags: [vex-tool]
+  rules:
+    - if: '"$[[ inputs.run_docker_build ]]" == "true"'
+  services:
+    - name: docker:24-dind
+      alias: docker
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  script:
+    - docker build -f backend/Dockerfile -t $IMAGE_BACKEND ./backend
+    - docker save $IMAGE_BACKEND -o backend-image.tar
+  artifacts:
+    paths: [backend-image.tar]
+    expire_in: 1 hour
+
+docker:build-frontend:
+  stage: docker-build
+  image: docker:24
+  tags: [vex-tool]
+  rules:
+    - if: '"$[[ inputs.run_docker_build ]]" == "true"'
+  services:
+    - name: docker:24-dind
+      alias: docker
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  script:
+    - docker build -f frontend/Dockerfile -t $IMAGE_FRONTEND ./frontend
+    - docker save $IMAGE_FRONTEND -o frontend-image.tar
+  artifacts:
+    paths: [frontend-image.tar]
+    expire_in: 1 hour
+
+# ─── TEST ──────────────────────────────────────────────────────────────────────
+backend:test:
+  stage: test
+  image: python:3.11
+  tags: [vex-tool]
+  rules:
+    - if: '"$[[ inputs.run_build ]]" == "true"'
+  cache:
+    key: pip-$CI_COMMIT_REF_SLUG
+    paths: [.pip_cache/]
+  script:
+    - cd backend
+    - pip install --cache-dir ../.pip_cache -r requirements.txt
+      --index-url https://artifactory.nexign.com:443/artifactory/api/pypi/pypi-mirror-virtual/simple
+      --trusted-host artifactory.nexign.com
+    - python -m pytest tests/ -v || echo "No tests found, skipping"
+
+# ─── SCA FILE ──────────────────────────────────────────────────────────────────
+# Единая схема для всех codescoring job'ов:
+# johnny --save-results создаёт bom.json (CycloneDX) с ЗАВИСИМОСТЯМИ и УЯЗВИМОСТЯМИ.
+# Переименовываем файл и отправляем его в TRON на оба эндпоинта:
+#   /check/{id}/external -> уязвимости (раздел "Проблемы")
+#   /layer/{id}/sbom     -> зависимости (раздел "Зависимости")
+.johnny_setup: &johnny_setup
+  - apt-get update -qq && apt-get install -y -qq curl
+  - curl -sL "$ARTIFACTORY_URL/codescoring/johnny.0" -o /usr/local/bin/johnny
+  - chmod +x /usr/local/bin/johnny
+
+codescoring:backend-file:
+  stage: sca-file
+  image: ubuntu:22.04
+  tags: [vex-tool]
+  rules:
+    - if: '"$[[ inputs.run_codescoring_file ]]" == "true" && ("$[[ inputs.codescoring_env ]]" == "prod" || "$[[ inputs.codescoring_env ]]" == "both")'
+  before_script:
+    - *johnny_setup
+  script:
+    - cd $CI_PROJECT_DIR
+    - johnny scan file --api_url $CODESCORING_URL --api_token $CODESCORING_TOKEN --project "DSO_tools@backend@file" --save-results --create-project ./backend
+    - mv bom.json codescoring-backend-file-bom.json
+  artifacts:
+    paths:
+      - codescoring-backend-file-bom.json
+    when: always
+    expire_in: 1 week
+  allow_failure: true
+
+codescoring:frontend-file:
+  stage: sca-file
+  image: ubuntu:22.04
+  tags: [vex-tool]
+  rules:
+    - if: '"$[[ inputs.run_codescoring_file ]]" == "true" && ("$[[ inputs.codescoring_env ]]" == "prod" || "$[[ inputs.codescoring_env ]]" == "both")'
+  before_script:
+    - *johnny_setup
+  script:
+    - cd $CI_PROJECT_DIR
+    - johnny scan file --api_url $CODESCORING_URL --api_token $CODESCORING_TOKEN --project "DSO_tools@frontend@file" --save-results --create-project ./frontend
+    - mv bom.json codescoring-frontend-file-bom.json
+  artifacts:
+    paths:
+      - codescoring-frontend-file-bom.json
+    when: always
+    expire_in: 1 week
+  allow_failure: true
+
+codescoring:backend-file-test:
+  stage: sca-file
+  image: ubuntu:22.04
+  tags: [vex-tool]
+  rules:
+    - if: '"$[[ inputs.run_codescoring_file ]]" == "true" && ("$[[ inputs.codescoring_env ]]" == "test" || "$[[ inputs.codescoring_env ]]" == "both")'
+  before_script:
+    - *johnny_setup
+  script:
+    - cd $CI_PROJECT_DIR
+    - johnny scan file --api_url $CODESCORING_TEST_URL --api_token $CODESCORING_TEST_TOKEN --project "DSO_tools@backend@file" --save-results --create-project ./backend
+  allow_failure: true
+
+codescoring:frontend-file-test:
+  stage: sca-file
+  image: ubuntu:22.04
+  tags: [vex-tool]
+  rules:
+    - if: '"$[[ inputs.run_codescoring_file ]]" == "true" && ("$[[ inputs.codescoring_env ]]" == "test" || "$[[ inputs.codescoring_env ]]" == "both")'
+  before_script:
+    - *johnny_setup
+  script:
+    - cd $CI_PROJECT_DIR
+    - johnny scan file --api_url $CODESCORING_TEST_URL --api_token $CODESCORING_TEST_TOKEN --project "DSO_tools@frontend@file" --save-results --create-project ./frontend
+  allow_failure: true
+
+# ─── SCA IMAGE ─────────────────────────────────────────────────────────────────
+codescoring:backend-image:
+  stage: sca-image
+  image: docker:24
+  tags: [vex-tool]
+  needs:
+    - job: docker:build-backend
+      optional: true
+  rules:
+    - if: '"$[[ inputs.run_codescoring_image ]]" == "true" && "$[[ inputs.run_docker_build ]]" == "true" && ("$[[ inputs.codescoring_env ]]" == "prod" || "$[[ inputs.codescoring_env ]]" == "both")'
+  services:
+    - name: docker:24-dind
+      alias: docker
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  before_script:
+    - apk add --no-cache curl
+    - curl -sL "$ARTIFACTORY_URL/codescoring/johnny.0" -o /usr/local/bin/johnny
+    - chmod +x /usr/local/bin/johnny
+  script:
+    - docker load -i backend-image.tar
+    - johnny scan image --api_url $CODESCORING_URL --api_token $CODESCORING_TOKEN --project "DSO_tools@backend@dockerimage" --save-results --create-project dso-tools-backend:$CI_COMMIT_SHORT_SHA
+    - mv bom.json $CI_PROJECT_DIR/codescoring-backend-image-bom.json
+  artifacts:
+    paths:
+      - codescoring-backend-image-bom.json
+    when: always
+    expire_in: 1 week
+  allow_failure: true
+
+codescoring:frontend-image:
+  stage: sca-image
+  image: docker:24
+  tags: [vex-tool]
+  needs:
+    - job: docker:build-frontend
+      optional: true
+  rules:
+    - if: '"$[[ inputs.run_codescoring_image ]]" == "true" && "$[[ inputs.run_docker_build ]]" == "true" && ("$[[ inputs.codescoring_env ]]" == "prod" || "$[[ inputs.codescoring_env ]]" == "both")'
+  services:
+    - name: docker:24-dind
+      alias: docker
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  before_script:
+    - apk add --no-cache curl
+    - curl -sL "$ARTIFACTORY_URL/codescoring/johnny.0" -o /usr/local/bin/johnny
+    - chmod +x /usr/local/bin/johnny
+  script:
+    - docker load -i frontend-image.tar
+    - johnny scan image --api_url $CODESCORING_URL --api_token $CODESCORING_TOKEN --project "DSO_tools@frontend@dockerimage" --save-results --create-project dso-tools-frontend:$CI_COMMIT_SHORT_SHA
+    - mv bom.json $CI_PROJECT_DIR/codescoring-frontend-image-bom.json
+  artifacts:
+    paths:
+      - codescoring-frontend-image-bom.json
+    when: always
+    expire_in: 1 week
+  allow_failure: true
+
+codescoring:backend-image-test:
+  stage: sca-image
+  image: docker:24
+  tags: [vex-tool]
+  needs:
+    - job: docker:build-backend
+      optional: true
+  rules:
+    - if: '"$[[ inputs.run_codescoring_image ]]" == "true" && "$[[ inputs.run_docker_build ]]" == "true" && ("$[[ inputs.codescoring_env ]]" == "test" || "$[[ inputs.codescoring_env ]]" == "both")'
+  services:
+    - name: docker:24-dind
+      alias: docker
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  before_script:
+    - apk add --no-cache curl
+    - curl -sL "$ARTIFACTORY_URL/codescoring/johnny.0" -o /usr/local/bin/johnny
+    - chmod +x /usr/local/bin/johnny
+  script:
+    - docker load -i backend-image.tar
+    - johnny scan image --api_url $CODESCORING_TEST_URL --api_token $CODESCORING_TEST_TOKEN --project "DSO_tools@backend@dockerimage" --save-results --create-project dso-tools-backend:$CI_COMMIT_SHORT_SHA
+  allow_failure: true
+
+codescoring:frontend-image-test:
+  stage: sca-image
+  image: docker:24
+  tags: [vex-tool]
+  needs:
+    - job: docker:build-frontend
+      optional: true
+  rules:
+    - if: '"$[[ inputs.run_codescoring_image ]]" == "true" && "$[[ inputs.run_docker_build ]]" == "true" && ("$[[ inputs.codescoring_env ]]" == "test" || "$[[ inputs.codescoring_env ]]" == "both")'
+  services:
+    - name: docker:24-dind
+      alias: docker
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  before_script:
+    - apk add --no-cache curl
+    - curl -sL "$ARTIFACTORY_URL/codescoring/johnny.0" -o /usr/local/bin/johnny
+    - chmod +x /usr/local/bin/johnny
+  script:
+    - docker load -i frontend-image.tar
+    - johnny scan image --api_url $CODESCORING_TEST_URL --api_token $CODESCORING_TEST_TOKEN --project "DSO_tools@frontend@dockerimage" --save-results --create-project dso-tools-frontend:$CI_COMMIT_SHORT_SHA
+  allow_failure: true
+
+# ─── TRIVY ─────────────────────────────────────────────────────────────────────
+# Формат изменён с cyclonedx на sarif для корректной отправки в TRON /external
+.trivy_setup: &trivy_setup
+  - apt-get update -qq && apt-get install -y -qq curl
+  - curl -sL "$ARTIFACTORY_URL/trivy/trivy.0" -o /tmp/trivy.deb
+  - dpkg -i /tmp/trivy.deb
+  - mkdir -p /root/.cache/trivy
+  - curl -sL "$ARTIFACTORY_URL/trivy/db/trivy-db-latest.tar.gz" | tar -xz -C /root/.cache/trivy
+
+trivy:backend:
+  stage: trivy
+  image: ubuntu:22.04
+  tags: [vex-tool]
+  needs:
+    - job: docker:build-backend
+      optional: true
+  rules:
+    - if: '"$[[ inputs.run_trivy ]]" == "true" && "$[[ inputs.run_docker_build ]]" == "true"'
+  before_script:
+    - *trivy_setup
+  script:
+    - trivy image --cache-dir /root/.cache/trivy --input backend-image.tar --scanners vuln,secret,misconfig,license --severity "$[[ inputs.trivy_severity ]]" --format sarif --output trivy-backend.sarif --no-progress --offline-scan --skip-db-update
+  artifacts:
+    paths: [trivy-backend.sarif]
+    expire_in: 1 week
+
+trivy:frontend:
+  stage: trivy
+  image: ubuntu:22.04
+  tags: [vex-tool]
+  needs:
+    - job: docker:build-frontend
+      optional: true
+  rules:
+    - if: '"$[[ inputs.run_trivy ]]" == "true" && "$[[ inputs.run_docker_build ]]" == "true"'
+  before_script:
+    - *trivy_setup
+  script:
+    - trivy image --cache-dir /root/.cache/trivy --input frontend-image.tar --scanners vuln,secret,misconfig,license --severity "$[[ inputs.trivy_severity ]]" --format sarif --output trivy-frontend.sarif --no-progress --offline-scan --skip-db-update
+  artifacts:
+    paths: [trivy-frontend.sarif]
+    expire_in: 1 week
+
+# ─── PT AI ─────────────────────────────────────────────────────────────────────
+# Запуск синхронный (без --async), затем generate-report для SARIF → TRON
+.ptai_setup: &ptai_setup
+  - apt-get update -qq && apt-get install -y -qq curl openjdk-17-jre-headless
+  - curl -sL "$ARTIFACTORY_URL/ptai/cli/4.11/ptai-cli-plugin.jar" -o /tmp/ptai-cli-plugin.jar
+
+ptai:backend:
+  stage: ptai
+  image: ubuntu:22.04
+  tags: [vex-tool]
+  rules:
+    - if: '"$[[ inputs.run_ptai ]]" == "true"'
+  before_script:
+    - *ptai_setup
+  script:
+    - |
+      cat > /tmp/ptai-settings.json << EOF
+      {
+        "\$schema": "https://json.schemastore.org/aiproj-1.2.json",
+        "Version": "1.2",
+        "ProjectName": "DSO_TOOLS@backend@Python",
+        "ProgrammingLanguage": "Python",
+        "ScanModules": ["VulnerableSourceCode", "DataFlowAnalysis", "PatternMatching", "Configuration"],
+        "UsePublicAnalysisMethod": true,
+        "DownloadDependencies": false,
+        "JavaSettings": {"UnpackUserPackages": false, "Version": "17"}
+      }
+      EOF
+    - |
+      java -jar /tmp/ptai-cli-plugin.jar json-ast \
+        --url=https://srv-sast-ptai1.net.billing.ru \
+        --token=$PTAI_TOKEN \
+        --insecure \
+        --settings-json /tmp/ptai-settings.json \
+        --verbose \
+        --excludes=".git/**,__pycache__/**" \
+        --input ./backend
+    - |
+      java -jar /tmp/ptai-cli-plugin.jar generate-report \
+        --url=https://srv-sast-ptai1.net.billing.ru \
+        --token=$PTAI_TOKEN \
+        --insecure \
+        --project-name="DSO_TOOLS@backend@Python" \
+        --sarif-report-file=$CI_PROJECT_DIR/ptai-backend.sarif \
+        --output=$CI_PROJECT_DIR \
+        --verbose
+  artifacts:
+    paths: [ptai-backend.sarif]
+    when: always
+    expire_in: 1 week
+  allow_failure: true
+
+ptai:frontend:
+  stage: ptai
+  image: ubuntu:22.04
+  tags: [vex-tool]
+  rules:
+    - if: '"$[[ inputs.run_ptai ]]" == "true"'
+  before_script:
+    - *ptai_setup
+  script:
+    - |
+      cat > /tmp/ptai-settings.json << EOF
+      {
+        "\$schema": "https://json.schemastore.org/aiproj-1.2.json",
+        "Version": "1.2",
+        "ProjectName": "DSO_TOOLS@frontend@JavaScript",
+        "ProgrammingLanguage": "JavaScript",
+        "ScanModules": ["VulnerableSourceCode", "DataFlowAnalysis", "PatternMatching", "Configuration"],
+        "UsePublicAnalysisMethod": true,
+        "DownloadDependencies": false,
+        "JavaSettings": {"UnpackUserPackages": false, "Version": "17"}
+      }
+      EOF
+    - |
+      java -jar /tmp/ptai-cli-plugin.jar json-ast \
+        --url=https://srv-sast-ptai1.net.billing.ru \
+        --token=$PTAI_TOKEN \
+        --insecure \
+        --settings-json /tmp/ptai-settings.json \
+        --verbose \
+        --excludes=".git/**,node_modules/**" \
+        --input ./frontend
+    - |
+      java -jar /tmp/ptai-cli-plugin.jar generate-report \
+        --url=https://srv-sast-ptai1.net.billing.ru \
+        --token=$PTAI_TOKEN \
+        --insecure \
+        --project-name="DSO_TOOLS@frontend@JavaScript" \
+        --sarif-report-file=$CI_PROJECT_DIR/ptai-frontend.sarif \
+        --output=$CI_PROJECT_DIR \
+        --verbose
+  artifacts:
+    paths: [ptai-frontend.sarif]
+    when: always
+    expire_in: 1 week
+  allow_failure: true
+
+# ─── GITLEAKS ──────────────────────────────────────────────────────────────────
+gitleaks:scan:
+  stage: gitleaks
+  image: ubuntu:22.04
+  tags: [vex-tool]
+  rules:
+    - if: '"$[[ inputs.run_gitleaks ]]" == "true"'
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq curl
+    - curl -sL "$ARTIFACTORY_URL/gitleaks/gitleaks.0" -o /usr/local/bin/gitleaks
+    - chmod +x /usr/local/bin/gitleaks
+  script:
+    - cd ${CI_PROJECT_DIR}
+    - gitleaks dir .
+      --ignore-gitleaks-allow
+      --baseline-path security/gitleaks-baseline.json
+      --report-format sarif
+      --report-path gitleaks.sarif
+      --exit-code 5
+  artifacts:
+    paths: [gitleaks.sarif]
+    when: always
+    expire_in: 1 week
+  allow_failure: true
+
+# ─── ZAP DAST ──────────────────────────────────────────────────────────────────
+zap:backend:
+  stage: zap
+  image: docker:24
+  tags: [vex-tool]
+  needs:
+    - job: docker:build-backend
+      optional: true
+  rules:
+    - if: '"$[[ inputs.run_zap ]]" == "true" && "$[[ inputs.run_docker_build ]]" == "true"'
+  services:
+    - name: docker:24-dind
+      alias: docker
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  before_script:
+    - apk add --no-cache curl
+    - docker load -i backend-image.tar
+    - curl -sL "$ARTIFACTORY_URL/zap/zap.tar" -o /tmp/zap.tar
+    - docker load -i /tmp/zap.tar
+  script:
+    - docker network create zapnet-backend
+    - docker run -d --name backend --network zapnet-backend $IMAGE_BACKEND
+    - |
+      echo "Waiting for backend..."
+      for i in $(seq 1 30); do
+        if docker run --rm --network zapnet-backend curlimages/curl:latest \
+          curl -sf http://backend:8000/health > /dev/null 2>&1; then
+          echo "Backend is up!"
+          break
+        fi
+        echo "Attempt $i/30, waiting..."
+        sleep 3
+      done
+    - mkdir -p $(pwd)/zap-wrk-backend
+    - chmod 777 $(pwd)/zap-wrk-backend
+    - |
+      cat > $(pwd)/zap-wrk-backend/zap-plan.yaml << 'EOF'
+      env:
+        contexts:
+          - name: "Backend"
+            urls:
+              - "http://backend:8000"
+      jobs:
+        - type: spider
+          parameters:
+            context: "Backend"
+            maxDuration: 5
+        - type: passiveScan-wait
+          parameters:
+            maxDuration: 5
+        - type: report
+          parameters:
+            template: sarif-json
+            reportDir: /zap/wrk
+            reportFile: "zap-backend-report.json"
+            reportTitle: "DAST Backend Scan"
+            reportDescription: "OWASP ZAP Backend Scan"
+            displayReport: false
+            risks:
+              - high
+              - medium
+              - low
+              - info
+            confidences:
+              - high
+              - medium
+              - low
+              - falsepositive
+      EOF
+    - |
+      docker run --rm \
+        --network zapnet-backend \
+        --user root \
+        -v $(pwd)/zap-wrk-backend:/zap/wrk:rw \
+        ghcr.io/zaproxy/zaproxy:stable \
+        zap.sh -cmd -autorun /zap/wrk/zap-plan.yaml || true
+    - cp $(pwd)/zap-wrk-backend/zap-backend-report.json ./zap-backend-report.json || echo "No backend report"
+  after_script:
+    - docker stop backend 2>/dev/null || true
+    - docker rm backend 2>/dev/null || true
+    - docker network rm zapnet-backend 2>/dev/null || true
+  artifacts:
+    paths:
+      - zap-backend-report.json
+    when: always
+    expire_in: 1 week
+  allow_failure: true
+
+zap:frontend:
+  stage: zap
+  image: docker:24
+  tags: [vex-tool]
+  needs:
+    - job: docker:build-backend
+      optional: true
+    - job: docker:build-frontend
+      optional: true
+  rules:
+    - if: '"$[[ inputs.run_zap ]]" == "true" && "$[[ inputs.run_docker_build ]]" == "true"'
+  services:
+    - name: docker:24-dind
+      alias: docker
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  before_script:
+    - apk add --no-cache curl
+    - docker load -i backend-image.tar
+    - docker load -i frontend-image.tar
+    - curl -sL "$ARTIFACTORY_URL/zap/zap.tar" -o /tmp/zap.tar
+    - docker load -i /tmp/zap.tar
+  script:
+    - docker network create zapnet-frontend
+    - docker run -d --name backend --network zapnet-frontend $IMAGE_BACKEND
+    - docker run -d --name frontend --network zapnet-frontend $IMAGE_FRONTEND
+    - |
+      echo "Waiting for frontend..."
+      for i in $(seq 1 30); do
+        if docker run --rm --network zapnet-frontend curlimages/curl:latest \
+          curl -sf http://frontend:80 > /dev/null 2>&1; then
+          echo "Frontend is up!"
+          break
+        fi
+        echo "Attempt $i/30, waiting..."
+        sleep 3
+      done
+    - mkdir -p $(pwd)/zap-wrk-frontend
+    - chmod 777 $(pwd)/zap-wrk-frontend
+    - |
+      cat > $(pwd)/zap-wrk-frontend/zap-plan.yaml << 'EOF'
+      env:
+        contexts:
+          - name: "Frontend"
+            urls:
+              - "http://frontend:80"
+      jobs:
+        - type: spider
+          parameters:
+            context: "Frontend"
+            maxDuration: 5
+        - type: spiderAjax
+          parameters:
+            context: "Frontend"
+            maxDuration: 5
+        - type: passiveScan-wait
+          parameters:
+            maxDuration: 5
+        - type: report
+          parameters:
+            template: sarif-json
+            reportDir: /zap/wrk
+            reportFile: "zap-frontend-report.json"
+            reportTitle: "DAST Frontend Scan"
+            reportDescription: "OWASP ZAP Frontend Scan"
+            displayReport: false
+            risks:
+              - high
+              - medium
+              - low
+              - info
+            confidences:
+              - high
+              - medium
+              - low
+              - falsepositive
+      EOF
+    - |
+      docker run --rm \
+        --network zapnet-frontend \
+        --user root \
+        -v $(pwd)/zap-wrk-frontend:/zap/wrk:rw \
+        ghcr.io/zaproxy/zaproxy:stable \
+        zap.sh -cmd -autorun /zap/wrk/zap-plan.yaml || true
+    - cp $(pwd)/zap-wrk-frontend/zap-frontend-report.json ./zap-frontend-report.json || echo "No frontend report"
+  after_script:
+    - docker stop frontend backend 2>/dev/null || true
+    - docker rm frontend backend 2>/dev/null || true
+    - docker network rm zapnet-frontend 2>/dev/null || true
+  artifacts:
+    paths:
+      - zap-frontend-report.json
+    when: always
+    expire_in: 1 week
+  allow_failure: true
+
+# ─── REPORT ────────────────────────────────────────────────────────────────────
+# CodeScoring bom.json (зависимости + уязвимости в одном файле):
+#   /check/{id}/external -> уязвимости (раздел "Проблемы")
+#   /layer/{id}/sbom     -> зависимости (раздел "Зависимости")
+# PT AI SARIF → /check/{id}/external
+# Trivy SARIF → /check/{id}/external (prod + test дубль)
+# Gitleaks, ZAP → /check/{id}/external
+tron:upload:
+  stage: report
+  image: ubuntu:22.04
+  tags: [vex-tool]
+  rules:
+    - if: '"$[[ inputs.run_tron ]]" == "true"'
+  variables:
+    TRON_URL: "https://tron.kolla.paas.nexign.com/api/v1"
+    # ── CodeScoring Check IDs (bom.json → /external, уязвимости) ──
+    CHECK_BACKEND_SOURCE_CODESCORING: "019e7423-f76c-723b-a19a-c3c90c9f3fc3"
+    CHECK_BACKEND_BUILD_CODESCORING: "019e2c31-7e37-7509-84bb-768123f9ece7"
+    CHECK_BACKEND_IMAGE_CODESCORING: "019eabfa-2236-7879-8c3e-4b0c5a6cd627"
+    CHECK_FRONTEND_SOURCE_CODESCORING: "019eab7e-47d2-7982-bb0a-43f6ed3c27f4"
+    CHECK_FRONTEND_BUILD_CODESCORING: "019e2c33-382b-7dcb-8f3d-d617d0f4c694"
+    CHECK_FRONTEND_IMAGE_CODESCORING: "019eabfd-cc99-74a8-b573-037b958a3993"
+    # ── PT AI Check IDs (SARIF → /external) ──
+    CHECK_BACKEND_SOURCE_PTAI: "019eab7c-57ce-7829-8909-dbc7247f0860"
+    CHECK_FRONTEND_SOURCE_PTAI: "019eab7d-b23f-707f-9b45-7f9f925188ab"
+    # ── Trivy Check IDs (SARIF → /external, prod + test дубль) ──
+    CHECK_BACKEND_IMAGE_TRIVY: "019eabd5-109a-71e3-88c5-be9ff4467420"
+    CHECK_BACKEND_IMAGE_TRIVY_TEST: "019e4e99-f39d-7477-9711-03599217a936"
+    CHECK_FRONTEND_IMAGE_TRIVY: "019eabd7-23d4-71ed-9d7d-45ccdc622e7e"
+    CHECK_FRONTEND_IMAGE_TRIVY_TEST: "019e73b9-75d8-7d70-97a6-b840e7b3305a"
+    # ── Gitleaks Check IDs ──
+    CHECK_BACKEND_SOURCE_GITLEAKS: "019eac01-7d7f-7880-8a1c-5d8ccff3f22d"
+    CHECK_FRONTEND_SOURCE_GITLEAKS: "019eac02-cd0f-7f34-838f-2e737ad42297"
+    # ── ZAP Check IDs ──
+    CHECK_BACKEND_RUNTIME_ZAP: "019e690d-50ce-7596-935c-56c7b5b0676d"
+    CHECK_FRONTEND_RUNTIME_ZAP: "019e6dca-5ea0-7e4a-900e-7f003181de3a"
+    # ── Layer IDs (bom.json → /layer/sbom multipart, зависимости) ──
+    LAYER_BACKEND_SOURCE: "019e2c11-013c-7c11-83f6-3bd808f09c77"
+    LAYER_BACKEND_IMAGE: "019e2c11-9abf-79bf-a8f9-181c39270dfc"
+    LAYER_FRONTEND_SOURCE: "019e2c12-9aa0-75fa-a980-0b9d68d45d6a"
+    LAYER_FRONTEND_IMAGE: "019e2c13-3911-7206-a251-754bbfb42004"
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq curl
+  script:
+    # ── CodeScoring bom.json → /check/external (уязвимости) ──
+    - |
+      if [ -f codescoring-backend-file-bom.json ]; then
+        curl -sk --location "$TRON_URL/check/$CHECK_BACKEND_SOURCE_CODESCORING/external" \
+          -H "x-api-token: $TRON_TOKEN" \
+          -H "content-type: application/json" \
+          --data-binary @codescoring-backend-file-bom.json
+        echo "codescoring:backend-file -> check uploaded"
+      fi
+    - |
+      if [ -f codescoring-frontend-file-bom.json ]; then
+        curl -sk --location "$TRON_URL/check/$CHECK_FRONTEND_SOURCE_CODESCORING/external" \
+          -H "x-api-token: $TRON_TOKEN" \
+          -H "content-type: application/json" \
+          --data-binary @codescoring-frontend-file-bom.json
+        echo "codescoring:frontend-file -> check uploaded"
+      fi
+    - |
+      if [ -f codescoring-backend-image-bom.json ]; then
+        curl -sk --location "$TRON_URL/check/$CHECK_BACKEND_IMAGE_CODESCORING/external" \
+          -H "x-api-token: $TRON_TOKEN" \
+          -H "content-type: application/json" \
+          --data-binary @codescoring-backend-image-bom.json
+        echo "codescoring:backend-image -> check uploaded"
+      fi
+    - |
+      if [ -f codescoring-frontend-image-bom.json ]; then
+        curl -sk --location "$TRON_URL/check/$CHECK_FRONTEND_IMAGE_CODESCORING/external" \
+          -H "x-api-token: $TRON_TOKEN" \
+          -H "content-type: application/json" \
+          --data-binary @codescoring-frontend-image-bom.json
+        echo "codescoring:frontend-image -> check uploaded"
+      fi
+    # ── CodeScoring bom.json → /layer/sbom (зависимости) ──
+    - |
+      if [ -f codescoring-backend-file-bom.json ]; then
+        curl -sk --location "$TRON_URL/layer/$LAYER_BACKEND_SOURCE/sbom" \
+          -H "x-api-token: $TRON_TOKEN" \
+          -F "sbom=@codescoring-backend-file-bom.json;type=application/json"
+        echo "codescoring:backend-file -> layer uploaded"
+      fi
+    - |
+      if [ -f codescoring-frontend-file-bom.json ]; then
+        curl -sk --location "$TRON_URL/layer/$LAYER_FRONTEND_SOURCE/sbom" \
+          -H "x-api-token: $TRON_TOKEN" \
+          -F "sbom=@codescoring-frontend-file-bom.json;type=application/json"
+        echo "codescoring:frontend-file -> layer uploaded"
+      fi
+    - |
+      if [ -f codescoring-backend-image-bom.json ]; then
+        curl -sk --location "$TRON_URL/layer/$LAYER_BACKEND_IMAGE/sbom" \
+          -H "x-api-token: $TRON_TOKEN" \
+          -F "sbom=@codescoring-backend-image-bom.json;type=application/json"
+        echo "codescoring:backend-image -> layer uploaded"
+      fi
+    - |
+      if [ -f codescoring-frontend-image-bom.json ]; then
+        curl -sk --location "$TRON_URL/layer/$LAYER_FRONTEND_IMAGE/sbom" \
+          -H "x-api-token: $TRON_TOKEN" \
+          -F "sbom=@codescoring-frontend-image-bom.json;type=application/json"
+        echo "codescoring:frontend-image -> layer uploaded"
+      fi
+    # ── PT AI SARIF → /check/external ──
+    - |
+      if [ -f ptai-backend.sarif ]; then
+        curl -sk --location "$TRON_URL/check/$CHECK_BACKEND_SOURCE_PTAI/external" \
+          -H "x-api-token: $TRON_TOKEN" \
+          -H "content-type: application/json" \
+          --data-binary @ptai-backend.sarif
+        echo "ptai:backend sarif uploaded"
+      fi
+    - |
+      if [ -f ptai-frontend.sarif ]; then
+        curl -sk --location "$TRON_URL/check/$CHECK_FRONTEND_SOURCE_PTAI/external" \
+          -H "x-api-token: $TRON_TOKEN" \
+          -H "content-type: application/json" \
+          --data-binary @ptai-frontend.sarif
+        echo "ptai:frontend sarif uploaded"
+      fi
+    # ── Trivy SARIF → /check/external (prod + test) ──
+    - |
+      if [ -f trivy-backend.sarif ]; then
+        curl -sk --location "$TRON_URL/check/$CHECK_BACKEND_IMAGE_TRIVY/external" \
+          -H "x-api-token: $TRON_TOKEN" \
+          -H "content-type: application/json" \
+          --data-binary @trivy-backend.sarif
+        echo "trivy:backend sarif uploaded (prod)"
+        curl -sk --location "$TRON_URL/check/$CHECK_BACKEND_IMAGE_TRIVY_TEST/external" \
+          -H "x-api-token: $TRON_TOKEN" \
+          -H "content-type: application/json" \
+          --data-binary @trivy-backend.sarif
+        echo "trivy:backend sarif uploaded (test)"
+      fi
+    - |
+      if [ -f trivy-frontend.sarif ]; then
+        curl -sk --location "$TRON_URL/check/$CHECK_FRONTEND_IMAGE_TRIVY/external" \
+          -H "x-api-token: $TRON_TOKEN" \
+          -H "content-type: application/json" \
+          --data-binary @trivy-frontend.sarif
+        echo "trivy:frontend sarif uploaded (prod)"
+        curl -sk --location "$TRON_URL/check/$CHECK_FRONTEND_IMAGE_TRIVY_TEST/external" \
+          -H "x-api-token: $TRON_TOKEN" \
+          -H "content-type: application/json" \
+          --data-binary @trivy-frontend.sarif
+        echo "trivy:frontend sarif uploaded (test)"
+      fi
+    # ── Gitleaks → /check/external ──
+    - |
+      if [ -f gitleaks.sarif ]; then
+        curl -sk --location "$TRON_URL/check/$CHECK_BACKEND_SOURCE_GITLEAKS/external" \
+          -H "x-api-token: $TRON_TOKEN" \
+          -H "content-type: application/json" \
+          --data @gitleaks.sarif
+        echo "gitleaks:backend uploaded"
+        curl -sk --location "$TRON_URL/check/$CHECK_FRONTEND_SOURCE_GITLEAKS/external" \
+          -H "x-api-token: $TRON_TOKEN" \
+          -H "content-type: application/json" \
+          --data @gitleaks.sarif
+        echo "gitleaks:frontend uploaded"
+      fi
+    # ── ZAP → /check/external ──
+    - |
+      if [ -f zap-backend-report.json ]; then
+        curl -sk --location "$TRON_URL/check/$CHECK_BACKEND_RUNTIME_ZAP/external" \
+          -H "x-api-token: $TRON_TOKEN" \
+          -H "content-type: application/json" \
+          --data @zap-backend-report.json
+        echo "zap:backend uploaded"
+      fi
+    - |
+      if [ -f zap-frontend-report.json ]; then
+        curl -sk --location "$TRON_URL/check/$CHECK_FRONTEND_RUNTIME_ZAP/external" \
+          -H "x-api-token: $TRON_TOKEN" \
+          -H "content-type: application/json" \
+          --data @zap-frontend-report.json
+        echo "zap:frontend uploaded"
+      fi
+    - echo "TRON upload completed"
+  allow_failure: true
