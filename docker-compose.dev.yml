@@ -1,0 +1,13 @@
+version: "3.9"
+
+# Локальная разработка — переопределяет образы на сборку из исходников
+# Использование: docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+
+services:
+  backend:
+    build: ./backend
+    image: sergeybakunin/nexign-asoc-backend:dev
+
+  frontend:
+    build: ./frontend
+    image: sergeybakunin/nexign-asoc-frontend:dev
